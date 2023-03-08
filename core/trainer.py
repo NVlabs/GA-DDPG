@@ -69,7 +69,7 @@ class AgentWrapper(object):
     Wrapper class for agent training and logging
     """
     def __init__(self, args_, config_,  pretrained_path=None, input_dim=512,
-                       logdir=None, set_init_step=False, model_surfix='latest', model_path=None, buffer_id=None):
+                       logdir=None, set_init_step=False, model_surfix='latest', model_path=None, buffer_id=None, add_expert=False):
 
         from core.bc import BC
         from core.ddpg import DDPG
@@ -80,9 +80,10 @@ class AgentWrapper(object):
         torch.manual_seed(self.args.seed)
         POLICY = self.args.policy
 
-        self.agent = eval(POLICY)(input_dim, PandaTaskSpace6D(), self.config)
+        self.agent = eval(POLICY)(input_dim, PandaTaskSpace6D(), self.config, add_expert=add_expert)
         net_dict = make_nets_opts_schedulers(self.cfg.RL_MODEL_SPEC,  self.config)
-        self.agent.setup_feature_extractor(net_dict)
+        net_dict_expert = make_nets_opts_schedulers(self.cfg.RL_MODEL_SPEC, self.config) if add_expert else None
+        self.agent.setup_feature_extractor(net_dict, net_dict_expert=net_dict_expert)
         self.buffer_id = buffer_id
 
         self.model_path = model_path
@@ -117,10 +118,14 @@ class AgentWrapper(object):
         return self.agent
 
     def select_action(self, state, actions=None, goal_state=None, remain_timestep=1,
-                      gt_goal_rollout=True, curr_joint=None, gt_traj=None):
+                      gt_goal_rollout=True, curr_joint=None, gt_traj=None, expert_policy=False):
         """ on policy action """
-        action, traj, extra_pred, aux_pred = self.agent.select_action(state, actions=actions, goal_state=goal_state, remain_timestep=remain_timestep)
+        action, traj, extra_pred, aux_pred = self.agent.select_action(state, actions=actions, goal_state=goal_state, remain_timestep=remain_timestep, expert_policy=expert_policy)
         return action, traj, extra_pred, aux_pred
+
+    def select_action_grasp(self, state, decision_threshold):
+        action = self.agent.select_action_grasp(state, decision_threshold)
+        return action
 
     def update_parameter(self, batch_data, updates, i):
         return self.agent.update_parameters(batch_data,  updates, i)
@@ -145,7 +150,11 @@ class Trainer(object):
         self.buffer_remote_id = buffer_remote_id
         self.online_buffer_remote_id = online_buffer_remote_id
         self.epoch = 0
-        self.updates = ray.get(agent_remote_id.get_agent_update_step.remote())
+        self.use_ray = isinstance(self.agent_remote_id, ray.actor.ActorHandle)
+        if self.use_ray:
+            self.updates = ray.get(agent_remote_id.get_agent_update_step.remote())
+        else:
+            self.updates = agent_remote_id.get_agent_update_step()
         self.agent_update_step = self.updates
         if logdir is not None:
             self.writer = SummaryWriter(logdir=logdir)
@@ -153,11 +162,17 @@ class Trainer(object):
         self.losses_info = get_loss_info_dict()
 
     def save_epoch_model(self, update_step):
-        ray.get(self.agent_remote_id.save_model.remote(surfix='epoch_{}'.format(update_step)))
+        if self.use_ray:
+            ray.get(self.agent_remote_id.save_model.remote(surfix='epoch_{}'.format(update_step)))
+        else:
+            self.agent_remote_id.save_model(surfix='epoch_{}'.format(update_step))
         print_and_write(self.file_handle, 'save model path: {} {} step: {}'.format(self.config.output_time, self.config.logdir, update_step))
 
     def save_latest_model(self, update_step):
-        ray.get(self.agent_remote_id.save_model.remote())
+        if self.use_ray:
+            ray.get(self.agent_remote_id.save_model.remote())
+        else:
+            self.agent_remote_id.save_model()
         print_and_write(self.file_handle, 'save model path: {} {} step: {}'.format(self.config.model_output_dir, self.config.logdir, update_step))
 
     def get_agent_update_step(self):
@@ -171,7 +186,11 @@ class Trainer(object):
         self.writer.add_text('script', cfg_repr(yaml.load(open(os.path.join(self.cfg.SCRIPT_FOLDER, self.args.config_file)).read())))
 
     def write_buffer_info(self, reward_info):
-        names = ['reward', 'avg_reward', 'online_reward', 'test_reward', 'avg_collision', 'avg_lifted']
+        names = ['reward', 'avg_reward', 'online_reward', 'test_reward']
+        if not self.config.HANDOVER_SIM2REAL.stage:
+            names += ['avg_collision', 'avg_lifted']
+        else:
+            names += ['avg_fail_1', 'avg_fail_2', 'avg_fail_3', 'avg_success_steps']
         for i in range(len(names)):
             eb_info, ob_info = reward_info[i]
             if ob_info != 0: self.writer.add_scalar('reward/ob_{}'.format(names[i]), ob_info, self.updates)
@@ -204,7 +223,10 @@ class Trainer(object):
         Run inner loop training and update parameters
         """
 
-        LOG_INTERVAL = 3
+        if not self.config.HANDOVER_SIM2REAL.stage:
+            LOG_INTERVAL = 3
+        else:
+            LOG_INTERVAL = 100
         self.epoch += 1
         if self.epoch < self.config.fill_data_step:
             return [0] # collect some traj first
@@ -212,22 +234,32 @@ class Trainer(object):
         batch_size = self.config.batch_size
 
         onpolicy_batch_size = int(batch_size * self.config.online_buffer_ratio)
-        batch_data, online_batch_data = ray.get([self.buffer_remote_id.sample.remote(self.config.batch_size), self.online_buffer_remote_id.sample.remote(onpolicy_batch_size)])
+        if self.use_ray:
+            batch_data, online_batch_data = ray.get([self.buffer_remote_id.sample.remote(self.config.batch_size), self.online_buffer_remote_id.sample.remote(onpolicy_batch_size)])
+        else:
+            batch_data = self.buffer_remote_id.sample(self.config.batch_size)
+            online_batch_data = self.online_buffer_remote_id.sample(onpolicy_batch_size)
 
-        if self.config.ON_POLICY:
+        if not self.config.HANDOVER_SIM2REAL.stage and self.config.ON_POLICY or self.config.HANDOVER_SIM2REAL.stage and self.config.onpolicy:
             batch_data = {k: np.concatenate((batch_data[k], online_batch_data[k]), axis=0) for k in batch_data.keys() \
                                 if type(batch_data[k]) is np.ndarray and k in online_batch_data.keys()}
         if len(batch_data) == 0: return [0]
 
         for i in range(self.config.updates_per_step):
-            batch_data, online_batch_data, main_loss, (update_step, lrs) = ray.get([
-                                                        self.buffer_remote_id.sample.remote(self.config.batch_size),
-                                                        self.online_buffer_remote_id.sample.remote(onpolicy_batch_size),
-                                                        self.agent_remote_id.update_parameter.remote(batch_data, self.updates, i),
-                                                        self.agent_remote_id.get_agent_lr_info.remote()
-                                                        ])
+            if self.use_ray:
+                batch_data, online_batch_data, main_loss, (update_step, lrs) = ray.get([
+                    self.buffer_remote_id.sample.remote(self.config.batch_size),
+                    self.online_buffer_remote_id.sample.remote(onpolicy_batch_size),
+                    self.agent_remote_id.update_parameter.remote(batch_data, self.updates, i),
+                    self.agent_remote_id.get_agent_lr_info.remote(),
+                ])
+            else:
+                main_loss = self.agent_remote_id.update_parameter(batch_data, self.updates, i)
+                batch_data = self.buffer_remote_id.sample(self.config.batch_size)
+                online_batch_data = self.online_buffer_remote_id.sample(onpolicy_batch_size)
+                (update_step, lrs) = self.agent_remote_id.get_agent_lr_info()
 
-            if self.config.ON_POLICY:
+            if not self.config.HANDOVER_SIM2REAL.stage and self.config.ON_POLICY or self.config.HANDOVER_SIM2REAL.stage and self.config.onpolicy:
                 batch_data = {k: np.concatenate((batch_data[k], online_batch_data[k]), axis=0) for k in batch_data.keys() \
                                  if type(batch_data[k]) is np.ndarray and k in online_batch_data.keys()}
 
@@ -255,11 +287,18 @@ class Trainer(object):
             self.save_latest_model(update_step)
 
         # log
-        buffer_info, online_buffer_info = ray.get([self.buffer_remote_id.get_info.remote(), self.online_buffer_remote_id.get_info.remote()])
+        if self.use_ray:
+            buffer_info, online_buffer_info = ray.get([self.buffer_remote_id.get_info.remote(), self.online_buffer_remote_id.get_info.remote()])
+        else:
+            buffer_info = self.buffer_remote_id.get_info()
+            online_buffer_info = self.online_buffer_remote_id.get_info()
         buffer_upper_idx, buffer_curr_idx, buffer_is_full, obj_performance_str, env_step, buffer_exp_idx, sample_time = buffer_info
         online_buffer_upper_idx, online_buffer_curr_idx, online_buffer_is_full, online_obj_performance_str, online_env_step, _, _ = online_buffer_info
         gpu_usage, memory_usage = get_usage()
-        incr_agent_update_step  = ray.get(self.agent_remote_id.get_agent_incr_update_step.remote())
+        if self.use_ray:
+            incr_agent_update_step = ray.get(self.agent_remote_id.get_agent_incr_update_step.remote())
+        else:
+            incr_agent_update_step = self.agent_remote_id.get_agent_incr_update_step()
         milestone_idx = int((incr_agent_update_step > np.array(self.config.mix_milestones)).sum())
         explore_ratio = min(get_valid_index(self.config.explore_ratio_list, milestone_idx), self.config.explore_cap)
         noise_scale = self.config.action_noise * get_valid_index(self.config.noise_ratio_list, milestone_idx)

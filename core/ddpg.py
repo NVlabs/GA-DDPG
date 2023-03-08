@@ -12,12 +12,15 @@ from core import networks
 from core.loss import *
 
 class DDPG(Agent):
-    def __init__(self, num_inputs, action_space, args):
+    def __init__(self, num_inputs, action_space, args, add_expert=False):
         super(DDPG, self).__init__(num_inputs, action_space, args, name='DDPG')
         action_dim = 0 if self.value_model else action_space.shape[0]
         self.critic_num_input = num_inputs + 1
         self.critic_value_dim = 0
         self.critic, self.critic_optim, self.critic_scheduler, self.critic_target = get_critic(self)
+
+        if add_expert:
+            self.policy_expert = copy.deepcopy(self.policy)
 
     def load_weight(self, weights):
         self.policy.load_state_dict(weights[0])
@@ -36,7 +39,7 @@ class DDPG(Agent):
     def extract_feature(self, image_batch, point_batch, action_batch=None,
                                             goal_batch=None, time_batch=None,
                                             vis=False, value=False, repeat=False,
-                                            train=True, curr_joint=None):
+                                            train=True, curr_joint=None, expert_policy=False):
         """
         extract features for policy learning
         """
@@ -51,7 +54,8 @@ class DDPG(Agent):
                                         gt_goal=goal_batch,
                                         val=value,
                                         repeat=repeat,
-                                        train=train)
+                                        train=train,
+                                        expert_policy=expert_policy)
 
         if self.use_time:
             feature = torch.cat((feature, time_batch[:,None]), dim=1)
@@ -126,7 +130,7 @@ class DDPG(Agent):
                            F.smooth_l1_loss(self.qf2.view(-1)[self.perturb_flag_batch], self.next_q_value[self.perturb_flag_batch])
         # F.smooth_l1_loss
 
-        if self.critic_aux:
+        if self.critic_aux and (not self.HANDOVER_SIM2REAL.stage or self.HANDOVER_SIM2REAL.stage == "pretrain"):
             self.critic_grasp_aux_loss += goal_pred_loss(self.critic_grasp_aux[self.goal_reward_mask, :7], self.goal_batch[self.goal_reward_mask])
 
     def critic_optimize(self):

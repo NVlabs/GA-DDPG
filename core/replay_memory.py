@@ -66,9 +66,23 @@ class BaseMemory(Dataset):
         )
         self.dir = args.RL_DATA_ROOT_DIR
         self.load_obj_performance()
+
+        if self.HANDOVER_SIM2REAL.stage:
+            (
+                self._FAIL_1,
+                self._FAIL_2,
+                self._FAIL_3,
+                self._STEPS,
+            ) = (
+                deque([0] * 50, maxlen=200),
+                deque([0] * 50, maxlen=200),
+                deque([0] * 50, maxlen=200),
+                deque([0] * 50, maxlen=200),
+            )
+
         self.init_buffer()
 
-    def update_reward(self, reward, test, explore, target_name):
+    def update_reward(self, reward, test, explore, target_name, fail_1=None, fail_2=None, fail_3=None, steps=None):
         self._TOTAL_REW += reward
         self._TOTAL_CNT += 1
         self._REW.append(reward)
@@ -79,18 +93,37 @@ class BaseMemory(Dataset):
         self.object_performance[target_name][0] += 1
         self.object_performance[target_name][1] += reward
 
+        if self.HANDOVER_SIM2REAL.stage:
+            self._FAIL_1.append(fail_1)
+            self._FAIL_2.append(fail_2)
+            self._FAIL_3.append(fail_3)
+            if reward > 0.5:
+                self._STEPS.append(steps)
+
     def load_obj_performance(self):
         self.object_performance = {}
 
     def reward_info(self):
-        return (
-            self._TOTAL_REW / self._TOTAL_CNT,
-            np.mean(list(self._REW)),
-            np.mean(list(self._ONLINE_REW)),
-            np.mean(list(self._TEST_REW)),
-            0.,
-            0.
-        )
+        if not self.HANDOVER_SIM2REAL.stage:
+            return (
+                self._TOTAL_REW / self._TOTAL_CNT,
+                np.mean(list(self._REW)),
+                np.mean(list(self._ONLINE_REW)),
+                np.mean(list(self._TEST_REW)),
+                0.,
+                0.
+            )
+        else:
+            return (
+                self._TOTAL_REW / self._TOTAL_CNT,
+                np.mean(list(self._REW)),
+                np.mean(list(self._ONLINE_REW)),
+                np.mean(list(self._TEST_REW)),
+                np.mean(list(self._FAIL_1)),
+                np.mean(list(self._FAIL_2)),
+                np.mean(list(self._FAIL_3)),
+                np.mean(list(self._STEPS)),
+            )
 
     def print_obj_performance(self):
         s = "===========================performance cnt ========================\n"
@@ -215,8 +248,23 @@ class BaseMemory(Dataset):
             return
 
         if episode_length > 0:
-            self.update_reward(episode[-1]["reward"] > 0.5, test, explore, episode[-1]["target_name"] )
+            args = (episode[-1]["reward"] > 0.5, test, explore, episode[-1]["target_name"])
+            if self.HANDOVER_SIM2REAL.stage:
+                args += (
+                    episode[-1]["failure_case_1"],
+                    episode[-1]["failure_case_2"],
+                    episode[-1]["failure_case_3"],
+                    episode[-1]["timestep"],
+                )
+            self.update_reward(*args)
  
+        if (
+            self.HANDOVER_SIM2REAL.stage == "pretrain"
+            and self.name == "expert"
+            and episode[-1]["reward"] < 0.5
+        ):
+            return
+
         for transition in episode:
             self.push(transition)
 
@@ -236,7 +284,7 @@ class BaseMemory(Dataset):
         """   
         mask = self.expert_flags[batch_idx] == 0.0
         episode_end = self.episode_map[batch_idx]   
-        increment_idx = np.minimum(episode_end, batch_idx + 1).astype(np.int)
+        increment_idx = np.minimum(episode_end, batch_idx + 1).astype(int)
         goal_poses = [((se3_inverse(self.state_pose[batch_idx[i]]).dot(  #
                         self.state_pose[episode_end[i]])))  #
                         for i in range(len(batch_idx)) ]
@@ -252,7 +300,7 @@ class BaseMemory(Dataset):
         """
         Set some data in batch
         """
-        increment_idx = np.minimum(self.episode_map[batch_idx], batch_idx + 1).astype(np.int)
+        increment_idx = np.minimum(self.episode_map[batch_idx], batch_idx + 1).astype(int)
 
         data["grasp_sample_batch"] = np.zeros([0, 4, 4])  
         data["next_image_state_batch"] =  process_image_output(self.image_state[increment_idx])
@@ -373,7 +421,10 @@ class BaseMemory(Dataset):
         self.reward = np.zeros((self.buffer_size,), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size,), dtype=np.float32)
         self.pose = np.zeros((self.buffer_size,) + pose_size, dtype=np.float32)
-        self.point_state = np.zeros([self.buffer_size, 4, self.uniform_num_pts + 6])  
+        if not self.HANDOVER_SIM2REAL.stage:
+            self.point_state = np.zeros([self.buffer_size, 4, self.uniform_num_pts + 6])
+        else:
+            self.point_state = np.zeros([self.buffer_size, 5, self.uniform_num_pts])
         self.collide = np.zeros((self.buffer_size,), dtype=np.float32)
         self.grasp = np.zeros((self.buffer_size,), dtype=np.float32)
         self.state_pose = np.zeros((self.buffer_size, 4, 4), dtype=np.float32)

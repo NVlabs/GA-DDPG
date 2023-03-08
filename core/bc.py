@@ -9,7 +9,7 @@ from core.utils import *
 from core.agent import Agent 
 
 class BC(Agent):
-    def __init__(self, num_inputs, action_space, args):
+    def __init__(self, num_inputs, action_space, args, add_expert=False):
         super(BC, self).__init__(num_inputs, action_space, args, name='BC')
 
     def load_weight(self, weights):

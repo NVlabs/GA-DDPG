@@ -196,6 +196,8 @@ def make_nets_opts_schedulers(model_spec, config, cuda_device="cuda"):
                 net_args["critic_extra_latent"] = config.critic_extra_latent
             if config.sa_channel_concat:
                 spec["net_kwargs"]["action_concat"] = True
+            if config.HANDOVER_SIM2REAL.stage:
+                net_args["extra_latent"] = 2
 
         net_class = getattr(networks, spec["class"])
         net = net_class(**net_args)
@@ -958,26 +960,36 @@ def qrot(q, v):
     return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
 
 def get_policy_class(policy_net_name, args):
-    policy = networks.GaussianPolicy(
-        args.num_inputs,
-        args.action_dim,
-        args.hidden_size,
-        args.action_space,
-        extra_pred_dim=args.extra_pred_dim,
-         
-    ).to('cuda')
+    if policy_net_name == "GaussianPolicy":
+        policy = networks.GaussianPolicy(
+            args.num_inputs,
+            args.action_dim,
+            args.hidden_size,
+            args.action_space,
+            extra_pred_dim=args.extra_pred_dim,
+        ).to('cuda')
+    if policy_net_name == "GraspPredPolicy":
+        policy = networks.GraspPredPolicy(
+            args.num_inputs,
+            args.hidden_size,
+        ).to('cuda')
     policy_optim = Adam(
        policy.parameters(), lr=args.lr, eps=1e-5, weight_decay=1e-5 )
     policy_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         policy_optim, milestones=args.policy_milestones, gamma=args.lr_gamma)
-    policy_target = getattr(networks, policy_net_name)(
-        args.num_inputs,
-        args.action_dim,
-        args.hidden_size,
-        args.action_space,
-        extra_pred_dim=args.extra_pred_dim,
-         
-    ).to('cuda')
+    if policy_net_name == "GaussianPolicy":
+        policy_target = networks.GaussianPolicy(
+            args.num_inputs,
+            args.action_dim,
+            args.hidden_size,
+            args.action_space,
+            extra_pred_dim=args.extra_pred_dim,
+        ).to('cuda')
+    if policy_net_name == "GraspPredPolicy":
+        policy_target = networks.GraspPredPolicy(
+            args.num_inputs,
+            args.hidden_size,
+        ).to('cuda')
     return policy, policy_optim, policy_scheduler, policy_target
 
 

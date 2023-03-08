@@ -44,7 +44,11 @@ class Agent(object):
         action_space = action_space if self.use_action_limit else None
         self.action_space = action_space
         self.num_inputs = num_inputs
-        self.policy, self.policy_optim, self.policy_scheduler, self.policy_target = get_policy_class('GaussianPolicy', self)
+        if not self.HANDOVER_SIM2REAL.stage:
+            policy_net_name = 'GaussianPolicy'
+        else:
+            policy_net_name = self.HANDOVER_SIM2REAL.policy_net_name
+        self.policy, self.policy_optim, self.policy_scheduler, self.policy_target = get_policy_class(policy_net_name, self)
         self.action_dim = action_dim
 
 
@@ -59,6 +63,7 @@ class Agent(object):
         vis_image=False,
         train=True,
         repeat=False,
+        expert_policy=False,
     ):
         """
         Extract features from point cloud input
@@ -69,13 +74,22 @@ class Agent(object):
             state = torch.FloatTensor(state).cuda()
 
         grasp = None
-        point_state_feature, network_input = self.state_feature_extractor(
-            point_state,
-            grasp=grasp,
-            concat_option=self.concat_option,
-            feature_2=val,
-            train=train,
-        )
+        if not expert_policy:
+            point_state_feature, _ = self.state_feature_extractor(
+                point_state,
+                grasp=grasp,
+                concat_option=self.concat_option,
+                feature_2=val,
+                train=train,
+            )
+        else:
+            point_state_feature, _ = self.state_feature_extractor_expert(
+                point_state,
+                grasp=grasp,
+                concat_option=self.concat_option,
+                feature_2=val,
+                train=train,
+            )
 
         return point_state_feature
 
@@ -90,11 +104,15 @@ class Agent(object):
         grasp_set=None,
         gt_goal_rollout=False,
         repeat=False,
+        expert_policy=False,
     ):
 
         self.goal_feature_extractor.eval()
         self.state_feature_extractor.eval()
         self.policy.eval()
+        if expert_policy:
+            self.state_feature_extractor_expert.eval()
+            self.policy_expert.eval()
 
         if goal_state is not None:
             goal_state = torch.FloatTensor(goal_state).view(1, -1).cuda()
@@ -111,9 +129,13 @@ class Agent(object):
             value=False,
             repeat=repeat,
             train=False,
+            expert_policy=expert_policy,
         )
 
-        actions = self.policy.sample(feature)
+        if not expert_policy:
+            actions = self.policy.sample(feature)
+        else:
+            actions = self.policy_expert.sample(feature)
         action = actions[0].detach().cpu().numpy()[0]
         extra_pred = actions[1].detach().cpu().numpy()[0][0]
         action_sample = actions[2].detach().cpu().numpy()[0]
@@ -124,13 +146,34 @@ class Agent(object):
             aux_pred = goal_state.detach().cpu().numpy()[0]
         return action, extra_pred, action_sample, aux_pred
 
+    @torch.no_grad()
+    def select_action_grasp(self, state, decision_threshold):
+        self.goal_feature_extractor.eval()
+        self.state_feature_extractor.eval()
+        self.policy.eval()
+
+        point_state = torch.FloatTensor(state[0][0][None]).cuda()
+
+        feature = self.extract_feature(None, point_state, train=False)
+
+        grasp_trigger_pred_logits = (
+            self.policy.sample(feature).detach().cpu().numpy().astype(np.float64)[0]
+        )
+
+        grasp_trigger_pred_logits = np.clip(grasp_trigger_pred_logits, -10.0, +10.0)
+        grasp_trigger_pred = (
+            1 / (1 + np.exp(-1 * grasp_trigger_pred_logits)) > decision_threshold
+        )
+
+        return grasp_trigger_pred
+
     def compute_loss(self):
         """
         compute loss for policy and trajectory embedding
         """
 
 
-        if self.policy_aux:
+        if self.policy_aux and (not self.HANDOVER_SIM2REAL.stage or self.HANDOVER_SIM2REAL.stage == "pretrain"):
             self.policy_grasp_aux_loss =  goal_pred_loss(self.aux_pred[self.goal_reward_mask, :7], self.target_grasp_batch[self.goal_reward_mask, :7] )
 
         self.bc_loss =  pose_bc_loss(self.pi[self.expert_mask], self.expert_action_batch[self.expert_mask] )
@@ -146,7 +189,7 @@ class Agent(object):
         return {}
 
 
-    def setup_feature_extractor(self, net_dict, eval=False):
+    def setup_feature_extractor(self, net_dict, eval=False, net_dict_expert=None):
         """
         Load networks
         """
@@ -162,6 +205,10 @@ class Agent(object):
         self.state_feat_encoder_scheduler = state_feature_extractor[ "encoder_scheduler" ]
         self.state_feat_val_encoder_optim = state_feature_extractor[ "val_encoder_opt"  ]
         self.state_feat_val_encoder_scheduler =state_feature_extractor[ "val_encoder_scheduler" ]
+
+        if net_dict_expert is not None:
+            state_feature_extractor_expert = net_dict_expert["state_feature_extractor"]
+            self.state_feature_extractor_expert = state_feature_extractor_expert["net"]
 
     def get_lr(self):
         """
@@ -385,6 +432,11 @@ class Agent(object):
             print("load pretrained policy!!!!")
             hard_update(self.policy_target, self.policy, self.tau)
 
+        if hasattr(self, "policy_expert") and os.path.exists(actor_path):
+            net_dict = torch.load(actor_path)
+            self.policy_expert.load_state_dict(net_dict["net"])
+            print("load pretrained policy expert!!!!")
+
         if hasattr(self, "critic") and os.path.exists(critic_path):
             net_dict = torch.load(critic_path)
             self.critic.load_state_dict(net_dict["net"])
@@ -403,6 +455,16 @@ class Agent(object):
             print("load pretrained critic!!!!")
             hard_update(self.critic_target, self.critic, self.tau)
 
+        if hasattr(self, "state_feature_extractor_expert") and os.path.exists(
+            state_feat_path
+        ):
+            net_dict = torch.load(state_feat_path)
+            self.state_feature_extractor_expert.load_state_dict(net_dict["net"])
+            print(
+                "load ptrained feature expert!!!! from: {} step: {}".format(
+                    state_feat_path, net_dict["step"]
+                )
+            )
 
         if os.path.exists(state_feat_path):
             net_dict = torch.load(state_feat_path)

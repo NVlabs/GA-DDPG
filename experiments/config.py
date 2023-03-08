@@ -18,6 +18,7 @@ import tabulate
 from easydict import EasyDict as edict
 import IPython
 import yaml
+from yacs.config import CfgNode as CN
 
 root_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 # create output folders
@@ -176,6 +177,13 @@ __C.RL_TRAIN.buffer_full_size = -1
 __C.RL_TRAIN.buffer_start_idx = 0
 __C.RL_TRAIN.fill_data_step   = 10
 
+# handover-sim2real options
+#
+__C.RL_TRAIN.HANDOVER_SIM2REAL = edict()
+__C.RL_TRAIN.HANDOVER_SIM2REAL.stage = ""
+__C.RL_TRAIN.HANDOVER_SIM2REAL.policy_net_name = "GaussianPolicy"
+__C.RL_TRAIN.HANDOVER_SIM2REAL.sample_initial_joint_position_ratio = 0.7
+
 
 def process_cfg(reset_model_spec=True):
     """
@@ -281,10 +289,13 @@ def _merge_a_into_b(a, b):
 
     for k, v in a.items():
         if not k in b.keys():
-            continue
+            if type(b) is CN:
+                b[k] = v
+            else:
+                continue
 
         # the types must match, too
-        if type(b[k]) is not type(v):
+        if type(b) is not CN and type(b[k]) is not type(v):
             continue
 
         # recursively merge dicts
@@ -298,21 +309,31 @@ def _merge_a_into_b(a, b):
             b[k] = v
 
 
-def cfg_from_file(filename=None, dict=None, reset_model_spec=True):
+def cfg_from_file(filename=None, dict=None, reset_model_spec=True, no_merge=False, merge_to_cn_dict=False):
     """Load a config file and merge it into the default options."""
 
     with open(filename, "r") as f:
-        yaml_cfg = edict(yaml.load(f))
+        yaml_cfg = edict(yaml.load(f, yaml.Loader))
+    if no_merge:
+        return yaml_cfg
     if not reset_model_spec:
         output_dir = "/".join(filename.split("/")[:-1])
         __C.RL_MODEL_SPEC = os.path.join(
             output_dir, yaml_cfg["RL_MODEL_SPEC"].split("/")[-1]
         )
-    if dict is None:
-        _merge_a_into_b(yaml_cfg, __C)
+    if not merge_to_cn_dict:
+        if dict is None:
+            _merge_a_into_b(yaml_cfg, __C)
+        else:
+            _merge_a_into_b(yaml_cfg, dict)
+        process_cfg(reset_model_spec=reset_model_spec)
     else:
-        _merge_a_into_b(yaml_cfg, dict)
-    process_cfg(reset_model_spec=reset_model_spec)
+        _merge_a_into_b(yaml_cfg, __C)
+        process_cfg(reset_model_spec=reset_model_spec)
+        _merge_a_into_b(__C, dict)
+        for k in yaml_cfg:
+            if k not in __C:
+                _merge_a_into_b(yaml_cfg[k], dict[k])
 
 def save_cfg_to_file(filename, cfg):
     """Load a config file and merge it into the default options."""

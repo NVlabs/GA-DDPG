@@ -21,3 +21,4 @@ transforms3d
 scipy
 IPython
 pyopengl
+yacs

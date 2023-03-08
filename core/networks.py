@@ -375,3 +375,30 @@ class GaussianPolicy(nn.Module):
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
         return super(GaussianPolicy, self).to(device)
+
+
+class GraspPredPolicy(nn.Module):
+    def __init__(
+        self,
+        num_inputs,
+        hidden_dim,
+    ):
+        super(GraspPredPolicy, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.grasp_trigger_pred = nn.Linear(hidden_dim, 1)
+
+        self.apply(weights_init_)
+
+    def forward(self, state):
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        grasp_trigger_pred = self.grasp_trigger_pred(x)
+
+        return grasp_trigger_pred
+
+    def sample(self, state):
+        grasp_trigger_pred = self.forward(state)
+
+        return grasp_trigger_pred
